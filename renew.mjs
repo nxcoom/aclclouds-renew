@@ -6,11 +6,37 @@ import path from 'path';
 import { fileURLToPath } from 'node:url';
 
 const BASE = (process.env.ACL_BASE_URL || 'https://aclclouds.com').replace(/\/+$/, '');
-const USER = process.env.ACL_USERNAME || process.env.ACL_EMAIL || '';
-const PASS = process.env.ACL_PASSWORD || '';
 const SERVER_ID = process.env.ACL_SERVER_ID || '';
 const DRY_RUN = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true';
-const AUTH = path.resolve(process.env.ACL_AUTH_STATE || 'auth.json');
+
+// 多账号支持: ACL_ACCOUNTS (JSON 数组) 或兼容两仓库名命:
+//   bigxbossm 仓: ACL_USERNAME / ACL_PASSWORD, ACL_USERNAME_2 / ACL_PASSWORD_2 ...
+//   kanezikii 仓: EMAIL / PASSWORD, EMAIL_2 / PASSWORD_2 ...
+function loadAccounts() {
+  const accounts = [];
+  if (process.env.ACL_ACCOUNTS) {
+    try {
+      for (const a of JSON.parse(process.env.ACL_ACCOUNTS)) {
+        const u = a.username || a.user || a.email || '';
+        const p = a.password || a.pass || '';
+        if (u && p) accounts.push({ user: u, pass: p });
+      }
+    } catch (e) {
+      log(`ACL_ACCOUNTS 解析失败: ${e.message}`);
+    }
+  }
+  if (!accounts.length) {
+    const u1 = process.env.ACL_USERNAME || process.env.ACL_EMAIL || process.env.EMAIL || '';
+    const p1 = process.env.ACL_PASSWORD || process.env.PASSWORD || '';
+    if (u1 && p1) accounts.push({ user: u1, pass: p1 });
+    for (const k of [2, 3, 4]) {
+      const u = process.env[`ACL_USERNAME_${k}`] || process.env[`ACL_EMAIL_${k}`] || process.env[`EMAIL_${k}`] || '';
+      const p = process.env[`ACL_PASSWORD_${k}`] || process.env[`PASSWORD_${k}`] || '';
+      if (u && p) accounts.push({ user: u, pass: p });
+    }
+  }
+  return accounts;
+}
 const SHOT = path.resolve('shots');
 const VOCAB = [
   'Panel', 'VPS', 'Bot', 'Serveur', 'Cloud', 'ACLClouds',
@@ -132,7 +158,6 @@ function formatTgMessage({ failed, results = [], errorMsg = '' }) {
     title,
     '━━━━━━━━━━━━━━━━━━━━',
     `🕒 <b>执行时间</b>: ${beijingTime} (北京时间)`,
-    `👤 <b>当前账号</b>: <code>${USER || '未设置'}</code>`,
     `📊 <b>任务状态</b>: ${badge}`,
     '━━━━━━━━━━━━━━━━━━━━',
     '<b>服务详情</b>:',
@@ -287,13 +312,20 @@ async function solveCaptchaApi(page, context = 'renewal_gate') {
 
 async function api(page, p, method = 'GET', body) {
   return page.evaluate(async ({ p, method, body }) => {
-    const token = document.cookie.split('; ').find((c) => c.startsWith('XSRF-TOKEN='))?.split('=')[1];
+    // 2026-11 改版: 认证 API 以 <meta name="csrf-token"> 为准。
+    // XSRF-TOKEN cookie 是加密值且与会话不同步, POST 会 419/401。
+    const metaToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+    const cookieToken = document.cookie.split('; ').find((c) => c.startsWith('XSRF-TOKEN='))?.split('=')[1];
     const res = await fetch(p, {
       method,
       headers: {
         Accept: 'application/json',
         'X-Requested-With': 'XMLHttpRequest',
-        ...(token ? { 'X-XSRF-TOKEN': decodeURIComponent(token) } : {}),
+        ...(metaToken
+          ? { 'X-CSRF-TOKEN': metaToken }
+          : cookieToken
+            ? { 'X-XSRF-TOKEN': decodeURIComponent(cookieToken) }
+            : {}),
         ...(body ? { 'Content-Type': 'application/json' } : {}),
       },
       body: body ? JSON.stringify(body) : undefined,
@@ -312,37 +344,77 @@ async function loggedIn(page) {
   return r.status === 200 && r.data?.object === 'user';
 }
 
-async function login(page) {
-  log(`登录 ${BASE} as ${USER}`);
+async function dismissCookieConsent(page) {
+  for (const t of ['Accept all', 'Reject all']) {
+    const b = page.getByText(t, { exact: true }).first();
+    if (await b.isVisible().catch(() => false)) {
+      await b.click().catch(() => {});
+      await page.waitForTimeout(800);
+      log(`已关闭 Cookie 同意弹窗 (${t})`);
+      return;
+    }
+  }
+}
+
+async function solveLoginCap(page, attempt = 0) {
+  // 2026-11 新版 Cap 组件: 触发器是 shadowRoot 内 .captcha-trigger(role=button),
+  // 点击后自动进行工作量证明求解(约 3-10 秒), 完成后 token 写入 input[name=cap-token]。
+  // 旧版的 div[role=checkbox] 与登录四选一图验证码均已移除。
+  const ok = await page.evaluate(() => {
+    const el = document.querySelector('cap-widget');
+    if (!el) return false;
+    const t = el.shadowRoot?.querySelector('.captcha-trigger') || el.querySelector('.captcha-trigger');
+    if (t) { t.click(); return true; }
+    return false;
+  });
+  if (!ok) throw new Error('未找到 cap-widget 触发器');
+  log(`Cap 验证码自动求解中 (第 ${attempt + 1} 次)...`);
+  await page.waitForFunction(() => {
+    const el = document.querySelector('cap-widget');
+    const v = el && el.querySelector('input[name=cap-token]');
+    return !!(v && v.value && v.value.length > 10);
+  }, { timeout: 45000 });
+  log('Cap token 已生成');
+}
+
+async function login(page, acc = null, authPath = null) {
+  const user = acc?.user || '';
+  const pass = acc?.pass || '';
+  const statePath = authPath || path.resolve(process.env.ACL_AUTH_STATE || 'auth-1.json');
+  log(`登录 ${BASE} as ${user}`);
   await page.goto(`${BASE}/auth/login`, { waitUntil: 'domcontentloaded' });
   if (await loggedIn(page)) {
     log('已有会话,跳过验证码');
     return;
   }
-  if (fs.existsSync(AUTH)) {
+  if (fs.existsSync(statePath)) {
     log('会话失效,重新登录');
-    fs.unlinkSync(AUTH);
+    fs.unlinkSync(statePath);
   }
-  await page.fill('#username', USER);
-  await page.fill('#password', PASS);
+  await page.waitForSelector('cap-widget', { timeout: 30000 });
+  await dismissCookieConsent(page);
+  await page.fill('#username', user);
+  await page.fill('#password', pass);
   await shot(page, '01-login.png');
   let authed = false;
   for (let i = 0; i < 4 && !authed; i++) {
     try {
-      await solveCaptcha(page);
+      await solveLoginCap(page, i);
       authed = true;
     } catch (e) {
       log(`验证码失败(${i + 1}/4): ${e.message}`);
       await page.reload({ waitUntil: 'domcontentloaded' });
-      await page.fill('#username', USER);
-      await page.fill('#password', PASS);
+      await page.waitForTimeout(2000);
+      await dismissCookieConsent(page);
+      await page.fill('#username', user);
+      await page.fill('#password', pass);
     }
   }
   if (!authed) throw new Error('验证码多次失败');
   await page.click("button[type='submit']");
-  await page.waitForURL(/\/dashboard/, { timeout: 25000 });
-  await page.context().storageState({ path: AUTH });
-  log(`登录成功,会话写入 ${AUTH}`);
+  await page.waitForURL(/\/dashboard/, { timeout: 30000 });
+  await page.context().storageState({ path: statePath });
+  log(`登录成功,会话写入 ${statePath}`);
 }
 
 function formatRemaining(expiresAt) {
@@ -366,26 +438,51 @@ function formatRemaining(expiresAt) {
 
 async function discover(page) {
   const servers = [];
+  const seen = new Set();
+
+  // 2026-11 改版: 免费套餐服务在订阅接口 (/api/client 现在返回空列表)
+  const rSub = await api(page, '/api/client/credits/subscriptions');
+  if (rSub.status === 200 && Array.isArray(rSub.data?.subscriptions)) {
+    for (const s of rSub.data.subscriptions) {
+      const id = String(s.service_id || s.id || '').replace(/^hosting-/, '');
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      servers.push({
+        id,
+        uuid: id,
+        name: s.name || s.plan_name || id,
+        expiresAt: s.expires_at || null,
+        canRenew: !!s.can_renew,
+        kind: s.kind || 'hosting',
+      });
+    }
+  }
+
+  // 兼容旧版 Pterodactyl 服务器列表
   const r = await api(page, '/api/client');
   if (r.status === 200 && Array.isArray(r.data?.data)) {
     for (const item of r.data.data) {
       if (item.object === 'server' && item.attributes) {
-        servers.push({
-          id: item.attributes.identifier,
-          uuid: item.attributes.uuid,
-          name: item.attributes.name || item.attributes.identifier,
-          expiresAt: item.attributes.expires_at || null,
-          canRenew: !!item.attributes.can_renew,
-        });
+        const id = item.attributes.identifier;
+        if (id && !seen.has(id)) {
+          seen.add(id);
+          servers.push({
+            id,
+            uuid: item.attributes.uuid,
+            name: item.attributes.name || id,
+            expiresAt: item.attributes.expires_at || null,
+            canRenew: !!item.attributes.can_renew,
+          });
+        }
       }
     }
   }
 
-  if (SERVER_ID && !servers.some((s) => s.id === SERVER_ID || s.uuid === SERVER_ID)) {
+  if (SERVER_ID && !seen.has(SERVER_ID)) {
     servers.push({ id: SERVER_ID, uuid: SERVER_ID, name: SERVER_ID, expiresAt: null, canRenew: false });
   }
 
-  log(`发现服务: ${servers.map((s) => `${s.name}(${s.id}) 到期:${s.expiresAt || '未知'}`).join(', ') || '(无)'}`);
+  log(`发现服务: ${servers.map((s) => `${s.name}(${s.id.slice(0, 8)}…) 到期:${s.expiresAt || '未知'}`).join(', ') || '(无)'}`);
   return servers;
 }
 
@@ -395,10 +492,15 @@ function classifyRenew(r) {
     const msg = r.data?.message || (typeof r.data === 'string' ? r.data : JSON.stringify(r.data || {}));
     return { ok: true, skip: false, captcha: false, text: `续期成功${exp} ${msg.slice(0, 120)}` };
   }
-  if (r.status === 400 && (r.data?.error === 'renewal_not_available' || r.data?.code === 'renewal_not_available')) {
-    return { ok: true, skip: true, captcha: false, text: `未到续期窗口 剩余 ${r.data.days_remaining ?? r.data.hours_remaining ?? '?'} 天/小时` };
-  }
   const blob = typeof r.data === 'string' ? r.data : JSON.stringify(r.data || {});
+  // 2026-11 新端点: 422 renew_too_early = 未到窗口 (到期前2天才开放)
+  if (r.status === 422 && /renew_too_early/i.test(blob)) {
+    return { ok: true, skip: true, captcha: false, text: '未到续期窗口 (需在到期前 2 天内)' };
+  }
+  // 旧端点语义: 400 renewal_not_available
+  if (r.status === 400 && (r.data?.error === 'renewal_not_available' || r.data?.code === 'renewal_not_available' || /renewal_not_available/i.test(blob))) {
+    return { ok: true, skip: true, captcha: false, text: `未到续期窗口 剩余 ${r.data?.days_remaining ?? r.data?.hours_remaining ?? '?'}` };
+  }
   if (r.status === 403 && (/captcha/i.test(blob) || /challenge/i.test(blob) || /token/i.test(blob) || blob === '{}' || blob === '""')) {
     return { ok: false, skip: false, captcha: true, text: 'HTTP 403 captcha_required' };
   }
@@ -551,8 +653,15 @@ async function tryRenew(page, server) {
 
   // 2. API 直接续期及验证码补发
   log(`尝试 API 续期接口...`);
-  const renewPath = `/api/client/servers/${id}/upgrade/renew`;
+  // 2026-11 改版: 新订阅制端点 /api/client/hosting/apps/{uuid}/renew;
+  // 旧端点已 404, 若新端点 404 则回退旧路径兼容
+  let renewPath = `/api/client/hosting/apps/${id}/renew`;
   let r = await api(page, renewPath, 'POST', {});
+  if (r.status === 404) {
+    log('新端点 404, 回退旧端点 /api/client/servers/{id}/upgrade/renew');
+    renewPath = `/api/client/servers/${id}/upgrade/renew`;
+    r = await api(page, renewPath, 'POST', {});
+  }
   log(`API 初始响应: HTTP ${r.status} ${JSON.stringify(r.data || '')}`);
   let c = classifyRenew(r);
 
@@ -590,8 +699,16 @@ function resolveExecutablePath() {
   return undefined;
 }
 
+function maskUser(u) {
+  return String(u).replace(/^(.{2}).*?(@.*)$/, '$1****$2');
+}
+
 async function main() {
-  if (!USER || !PASS) throw new Error('缺少 ACL_USERNAME / ACL_PASSWORD');
+  const accounts = loadAccounts();
+  if (!accounts.length) {
+    throw new Error('未配置任何账号: 请设置 ACL_USERNAME/ACL_PASSWORD (或 EMAIL/EMAIL_2 / ACL_ACCOUNTS)');
+  }
+  log(`共加载 ${accounts.length} 个账号: ${accounts.map((a) => maskUser(a.user)).join(', ')}`);
   const execPath = resolveExecutablePath();
   const launchOptions = {
     headless: true,
@@ -599,56 +716,63 @@ async function main() {
     ...(execPath ? { executablePath: execPath } : {}),
   };
   const browser = await chromium.launch(launchOptions);
-  const context = await browser.newContext({
-    viewport: { width: 1440, height: 900 },
-    storageState: fs.existsSync(AUTH) ? AUTH : undefined,
-  });
-  const page = await context.newPage();
-  let summary = '';
-  let failed = false;
   const results = [];
-  try {
-    await login(page);
-    await shot(page, '03-dashboard.png');
+  let failed = false;
+  let anyRenewed = false;
 
-    const servers = await discover(page);
-    await shot(page, '04-projects.png');
+  for (let i = 0; i < accounts.length; i++) {
+    const acc = accounts[i];
+    const label = `账号${i + 1}(${maskUser(acc.user)})`;
+    const authPath = process.env.ACL_AUTH_STATE
+      ? `${process.env.ACL_AUTH_STATE}.${i + 1}`
+      : path.resolve(`auth-${i + 1}.json`);
+    const context = await browser.newContext({
+      viewport: { width: 1440, height: 900 },
+      storageState: fs.existsSync(authPath) ? authPath : undefined,
+    });
+    const page = await context.newPage();
+    log(`======== 开始处理 ${label} ========`);
+    try {
+      await login(page, acc, authPath);
+      await shot(page, `03-dashboard-${i + 1}.png`);
 
-    for (const server of servers) {
-      const res = await tryRenew(page, server);
-      results.push(res);
-    }
+      const servers = await discover(page);
+      await shot(page, `04-projects-${i + 1}.png`);
 
-    if (!results.length) {
+      if (!servers.length) {
+        failed = true;
+        results.push({ ok: false, skip: false, text: `${label}: 账号下未发现任何服务` });
+        continue;
+      }
+
+      for (const server of servers) {
+        const res = await tryRenew(page, server);
+        results.push({ ...res, text: `${label} ${res.text}` });
+        if (res.ok && !res.skip) anyRenewed = true;
+        if (!res.ok) failed = true;
+      }
+    } catch (e) {
       failed = true;
-      summary = '未找到可续期服务';
-    } else {
-      summary = results.map((r) => r.text).join('\n');
-      failed = results.some((r) => !r.ok);
+      results.push({ ok: false, skip: false, text: `${label}: 执行失败 - ${e.message}` });
+      log(`${label} 执行失败: ${e.message}`);
+      try { await shot(page, `99-error-${i + 1}.png`); } catch {}
+    } finally {
+      await context.close().catch(() => {});
     }
-
-    const hasRenewed = results.some((r) => r.ok && !r.skip);
-    if (hasRenewed) {
-      await shot(page, '06-result.png');
-    }
-  } catch (e) {
-    failed = true;
-    summary = `执行失败: ${e.message}`;
-    log(summary);
-    try { await shot(page, '99-error.png'); } catch {}
-  } finally {
-    await browser.close().catch(() => {});
   }
+  await browser.close().catch(() => {});
+
+  const summary = results.length ? results.map((r) => r.text).join('\n') : '未找到可续期服务';
   log(summary);
 
   // 截图仅限续期完成和执行失败
   let photoToSend = null;
+  const errPics = shots.filter((f) => f.includes('99-error'));
+  const donePics = shots.filter((f) => f.includes('06-result'));
   if (failed) {
-    const errPic = path.join(SHOT, '99-error.png');
-    if (fs.existsSync(errPic)) photoToSend = errPic;
-  } else if (results.some((r) => r.ok && !r.skip)) {
-    const donePic = path.join(SHOT, '06-result.png');
-    if (fs.existsSync(donePic)) photoToSend = donePic;
+    if (errPics.length && fs.existsSync(errPics[errPics.length - 1])) photoToSend = errPics[errPics.length - 1];
+  } else if (anyRenewed) {
+    if (donePics.length && fs.existsSync(donePics[donePics.length - 1])) photoToSend = donePics[donePics.length - 1];
   }
 
   const tgMessage = formatTgMessage({
