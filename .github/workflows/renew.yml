@@ -3,7 +3,7 @@ name: ACLClouds Auto Renew (fixed)
 on:
   schedule:
     # 每两天执行一次，北京时间早上 07:28 (UTC 23:28)
-    - cron: '28 23 */2 * *'
+    - cron: '28 23 */1 * *'
   workflow_dispatch: {}
 
 permissions:
