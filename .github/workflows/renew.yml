@@ -49,15 +49,16 @@ jobs:
 
       - name: Install Playwright Chromium
         run: |
-          for i in 1 2 3; do
-            if npx playwright install --with-deps chromium; then
-              exit 0
-            fi
-            echo "playwright install --with-deps 第 $i 次失败，15s 后重试..."
-            sleep 15
-          done
-          echo "带系统依赖安装失败，回退为仅安装浏览器（runner 镜像通常已具备 Chromium 运行库）"
+          # 默认不走 apt: runner 镜像已自带 Chromium 运行库,
+          # 且 runner 偶发 DNS 故障会让 --with-deps 卡死在 apt 源解析上
           npx playwright install chromium
+          # 启动自检; 若缺系统库再回退安装依赖 (apt 可用时)
+          if ! node -e "import('playwright').then(async ({chromium}) => { const b = await chromium.launch(); await b.close(); }).catch((e) => { console.error('[launch-check]', e.message); process.exit(1); })"; then
+            echo "Chromium 启动自检失败，回退安装系统依赖..."
+            for i in 1 2 3; do
+              npx playwright install --with-deps chromium && break || sleep 15
+            done
+          fi
 
       - name: Renew
         env:
