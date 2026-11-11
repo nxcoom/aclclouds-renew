@@ -141,6 +141,7 @@ function formatTgMessage({ failed, results = [], errorMsg = '' }) {
     second: '2-digit',
   });
 
+  const dryRun = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true';
   const hasRenewed = results.some((r) => r.ok && !r.skip);
   const allSkipped = results.length > 0 && results.every((r) => r.ok && r.skip);
 
@@ -149,6 +150,9 @@ function formatTgMessage({ failed, results = [], errorMsg = '' }) {
   if (failed) {
     title = '❌ <b>【ACLClouds 自动续期失败】</b>';
     badge = '⚠️ 续期任务异常';
+  } else if (dryRun) {
+    title = '🧪 <b>【ACLClouds 续期检查 - DRY_RUN】</b>';
+    badge = '🧪 演练模式，未实际提交续期';
   } else if (allSkipped) {
     title = '⏳ <b>【ACLClouds 续期检查 - 未到窗口】</b>';
     badge = 'ℹ️ 暂未到可续期时间';
@@ -175,6 +179,8 @@ function formatTgMessage({ failed, results = [], errorMsg = '' }) {
   lines.push('━━━━━━━━━━━━━━━━━━━━');
   if (failed) {
     lines.push('⚠️ 请及时查看 GitHub Actions 运行日志与失败截图排查。');
+  } else if (dryRun) {
+    lines.push('🧪 DRY_RUN 模式：仅登录与发现服务，未提交续期。');
   } else if (hasRenewed) {
     lines.push('✨ 服务已成功延期，将在下次预定周期继续自动守护。');
   } else {
@@ -203,46 +209,6 @@ async function ocrPick(dir, prompt, n) {
   log(`OCR prompt=${prompt} ${results.map((x) => `${x.i}:${x.text || x.guess}(${x.vsPrompt})`).join(' ')}`);
   if (!results[0] || results[0].vsPrompt < 75) throw new Error(`OCR 未匹配 ${prompt}: ${JSON.stringify(results)}`);
   return results[0].i;
-}
-
-async function solveCaptcha(page, prefix = '') {
-  const root = prefix ? `${prefix} ` : '';
-  const checkbox = page.locator(`${root}div[role='checkbox']`).first();
-  await checkbox.click();
-  await page.waitForSelector(`${root}.auth-captcha-option-img`, { timeout: 20000 });
-  await page.waitForFunction(
-    (sel) => {
-      const imgs = [...document.querySelectorAll(sel)];
-      return imgs.length > 0 && imgs.every((i) => i.naturalWidth > 0 && i.clientHeight > 0);
-    },
-    `${root}.auth-captcha-option-img`,
-    { timeout: 20000 }
-  );
-
-  const promptRaw = await page.locator(`${root}.auth-captcha-prompt`).innerText();
-  const prompt = promptRaw.replace(/^(?:Click on|Cliquez sur)\s+/i, '').trim();
-  const imgs = page.locator(`${root}.auth-captcha-option-img`);
-  const n = await imgs.count();
-  const dir = path.join(SHOT, 'captcha');
-  fs.mkdirSync(dir, { recursive: true });
-  for (let i = 0; i < n; i++) {
-    const src = await imgs.nth(i).getAttribute('src');
-    const url = src.startsWith('http') ? src : BASE + src;
-    const bytes = await page.evaluate(async (u) => {
-      const r = await fetch(u, { credentials: 'include' });
-      return Array.from(new Uint8Array(await r.arrayBuffer()));
-    }, url);
-    fs.writeFileSync(path.join(dir, `${i}.png`), Buffer.from(bytes));
-  }
-  await shot(page, '02-captcha.png');
-  const pick = await ocrPick(dir, prompt, n);
-  await page.locator(`${root}.auth-captcha-option`).nth(pick).evaluate((el) => el.click());
-  await page.waitForFunction(
-    (sel) => document.querySelector(sel)?.getAttribute('aria-checked') === 'true',
-    `${root}div[role='checkbox']`,
-    { timeout: 15000 }
-  );
-  log(`验证码通过: ${prompt} -> option ${pick + 1}`);
 }
 
 async function solveCaptchaApi(page, context = 'renewal_gate') {
@@ -700,7 +666,7 @@ async function tryRenew(page, server) {
       log(`带 Token API 续期响应: HTTP ${r.status} ${JSON.stringify(r.data || '')}`);
       c = classifyRenew(r);
     } catch (e) {
-      c = { ok: false, skip: false, captcha: false, text: `验证码求解失败: ${e.message}` };
+      c = { ok: false, skip: false, captcha: false, text: `验证码求解失败: ${e.message} (原始响应: HTTP ${r.status} ${JSON.stringify(r.data || '').slice(0, 150)})` };
     }
   }
 
@@ -760,7 +726,6 @@ async function main() {
   const browser = await chromium.launch(launchOptions);
   const results = [];
   let failed = false;
-  let anyRenewed = false;
 
   for (let i = 0; i < accounts.length; i++) {
     const acc = accounts[i];
@@ -790,7 +755,6 @@ async function main() {
       for (const server of servers) {
         const res = await tryRenew(page, server);
         results.push({ ...res, text: `${label} ${res.text}` });
-        if (res.ok && !res.skip) anyRenewed = true;
         if (!res.ok) failed = true;
       }
     } catch (e) {
@@ -807,14 +771,11 @@ async function main() {
   const summary = results.length ? results.map((r) => r.text).join('\n') : '未找到可续期服务';
   log(summary);
 
-  // 截图仅限续期完成和执行失败
+  // 截图仅失败时发送 (99-error-*.png)，成功不带图
   let photoToSend = null;
-  const errPics = shots.filter((f) => f.includes('99-error'));
-  const donePics = shots.filter((f) => f.includes('06-result'));
   if (failed) {
+    const errPics = shots.filter((f) => f.includes('99-error'));
     if (errPics.length && fs.existsSync(errPics[errPics.length - 1])) photoToSend = errPics[errPics.length - 1];
-  } else if (anyRenewed) {
-    if (donePics.length && fs.existsSync(donePics[donePics.length - 1])) photoToSend = donePics[donePics.length - 1];
   }
 
   const tgMessage = formatTgMessage({

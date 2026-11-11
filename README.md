@@ -1,27 +1,27 @@
 # ACLClouds Auto-Renew
 
-ACLClouds Free Bot 托管自动续期。Free 套餐约 4 天到期，到期前 2 天才开放续期。脚本用账号密码登录（OCR 过站点自定义验证码），发现真实 server id，调用续期 API。GitHub Actions 每天跑一次，结果发 Telegram。
+ACLClouds Free Bot 托管自动续期。Free 套餐约 4 天到期，到期前 2 天才开放续期。脚本用账号密码登录（登录验证码为 Cap 工作量证明组件，自动求解），发现服务 id，UI + API 双路径续期，并回读订阅接口校验到期时间真的后移。GitHub Actions 每天跑一次，结果发 Telegram。
 
 ## 做什么
 
-1. Playwright 打开 `/auth/login`，填 `ACL_USERNAME` / `ACL_PASSWORD`
-2. 点「I am not a robot」，四选一词图用 tesseract.js 对 prompt 识别后点击
-3. 登录进 dashboard，扫页面链接 + `/api/client` / `/api/client/credits/subscriptions` 找 server id
-4. `POST /api/client/servers/{id}/upgrade/renew`
-   - `200` 续期成功
-   - `400 renewal_not_available` 未到窗口（按成功处理）
+1. Playwright 打开 `/auth/login`，填账号密码，自动求解 `cap-widget`（无感直通或 PoW，约 3-10s）
+2. 登录进 dashboard，通过 `/api/client/credits/subscriptions`（兼容旧版 `/api/client`）发现服务
+3. 优先访问 `/server/:id` 点 UI 续期按钮；点击后轮询订阅接口，确认 `expires_at` 后移才判成功，否则转入 API 兜底
+4. API 续期 `POST /api/client/hosting/apps/{uuid}/renew`（新端点 404 时回退旧路径 `/api/client/servers/{id}/upgrade/renew`）
+   - `2xx` 续期成功（回读订阅接口校验到期时间，写入 TG 消息）
+   - `422 renew_too_early` 未到窗口（按成功跳过处理）
+   - `403 captcha_required` 过一次 Cap 验证码后带 token 重试
    - 其它状态当失败
 5. Telegram 通知（见下）
-
-实测：账号 `aclbot_638370` 的真实 server id 是 `da9333c4`（不是面板 URL 里的 `5c0ab2ab`）。
 
 ## Telegram
 
 | 结果 | 发什么 |
 |---|---|
-| 续期成功 | 一条最终状态，不带图 |
+| 续期成功 | 一条最终状态（含新到期时间），不带图 |
 | 未到续期窗口 | 一条最终状态（剩余天数），不带图 |
-| 续期失败 / 崩溃 | 最终状态 + 续期相关截图 |
+| DRY_RUN | 标题带 🧪 演练标识，不提交续期 |
+| 续期失败 / 崩溃 | 最终状态 + 失败截图 |
 
 登录、验证码过程不发 TG。本地仍会把全过程截图写到 `shots/`。
 
@@ -29,17 +29,18 @@ ACLClouds Free Bot 托管自动续期。Free 套餐约 4 天到期，到期前 2
 
 `.github/workflows/renew.yml`：每天 UTC `23:28`（北京时间 07:28），也可手动 Run workflow。
 
-Secrets：
+Secrets（两套命名二选一，都配则以 `ACL_` 为准）：
 
 | 名 | 用途 |
 |---|---|
-| `ACL_USERNAME` | 登录用户名 |
-| `ACL_PASSWORD` | 密码 |
-| `ACL_SERVER_ID` | 可选，已知 server id（如 `da9333c4`）；留空则自动发现 |
+| `ACL_USERNAME` / `ACL_PASSWORD` | 登录账号（也支持 `EMAIL`/`PASSWORD`；`EMAIL_2`/`PASSWORD_2` … 最多 4 个账号） |
+| `ACL_SERVER_ID` | 可选；留空自动发现全部服务 |
 | `TG_BOT_TOKEN` | Telegram bot token |
 | `TG_CHAT_ID` | Telegram chat id |
 
 Variable（可选）：`ACL_BASE_URL`，默认 `https://aclclouds.com`
+
+登录会话缓存为 `auth-N.json`（Actions cache），命中则跳过验证码；失效自动删除重登。
 
 ## 本地跑
 
@@ -56,18 +57,16 @@ node with-env.cjs
 
 **已完成**
 
-- 账号密码登录，不再依赖手动导出 session cookie
-- 站点自定义验证码（Click on Panel/Bot/Discord…）OCR 可过，workflow 已实测
-- 自动发现真实 Pterodactyl server id（`da9333c4`），并跳过面板短 id `5c0ab2ab` 的 404
-- 续期接口打通；窗口外返回 `renewal_not_available` 视为正常
-- Actions 定时 + Secrets / Variable
-- TG：成功或未到窗口只发最终续期状态；失败才发续期/报错截图。登录和验证码不通知
-- OCR 用词表校正：`ACLCiouds` 这类 1 字母误差按 `ACLClouds` 计
-- 登录成功写入 `auth.json`，Actions cache 下次跳过验证码；失效则删掉重登
-- `403 captcha_required` 再过一次验证码后重试续期
-- 未设 `ACL_SERVER_ID` 时对发现的每台都续；设了则只打这一台
+- 账号密码登录，`cap-widget` 自动求解；会话缓存命中则跳过
+- 订阅接口发现服务；未设 `ACL_SERVER_ID` 时逐台续期
+- UI + API 双路径续期；UI 点击后回读订阅接口校验 `expires_at` 后移，避免静态文本误判成功
+- `422 renew_too_early` 视为未到窗口；`403 captcha_required` 过 Cap 盾后带 token 重试
+- 续期成功后校验到期时间并写入 TG
+- Actions 每天定时 + Secrets / Variable；Playwright 安装带 apt DNS 容错与浏览器缓存
+- 2026-11-12 实测：窗口内 UI 续期成功，到期 11-13 → 11-17 (+4 天)
 
 **待做**
 
-- 等窗口打开再打一次，确认 `200` 后续期天数真的往后推
+- `403 captcha_required` 路径尚未在真实窗口内触发过，触发时需按日志核对 Cap token 提交格式
+- 旧版 OCR 四选一验证码兜底（`/auth/captcha/challenge`）站点已改版，大概率失效，仅作降级保留
 - OCR 极端扭曲图仍可能卡死（认空/认错会换题，最多 4 次）

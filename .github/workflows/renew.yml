@@ -1,4 +1,4 @@
-name: ACLClouds Auto Renew (fixed)
+name: ACLClouds Auto Renew
 
 on:
   schedule:
@@ -42,10 +42,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-browsers-${{ runner.os }}-${{ hashFiles('package-lock.json') || 'no-lock' }}
+          key: playwright-browsers-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       - name: Install npm deps
-        run: npm install
+        run: npm ci
 
       - name: Install Playwright Chromium
         run: |
@@ -74,4 +74,4 @@ jobs:
           ACL_BASE_URL: ${{ vars.ACL_BASE_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: node renew-fixed.mjs
+        run: node renew.mjs
