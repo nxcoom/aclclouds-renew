@@ -37,10 +37,27 @@ jobs:
           restore-keys: |
             acl-session-
 
-      - name: Install
+      # runner 偶发 DNS 故障会导致 apt 源解析失败, 从而 --with-deps 失败
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-browsers-${{ runner.os }}-${{ hashFiles('package-lock.json') || 'no-lock' }}
+
+      - name: Install npm deps
+        run: npm install
+
+      - name: Install Playwright Chromium
         run: |
-          npm install
-          npx playwright install --with-deps chromium
+          for i in 1 2 3; do
+            if npx playwright install --with-deps chromium; then
+              exit 0
+            fi
+            echo "playwright install --with-deps 第 $i 次失败，15s 后重试..."
+            sleep 15
+          done
+          echo "带系统依赖安装失败，回退为仅安装浏览器（runner 镜像通常已具备 Chromium 运行库）"
+          npx playwright install chromium
 
       - name: Renew
         env:
