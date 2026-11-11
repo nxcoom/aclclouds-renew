@@ -3,5 +3,5 @@
 node_modules/
 shots/
 .cache/
-auth.json
+auth*.json
 *.traineddata

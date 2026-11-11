@@ -31,6 +31,8 @@ ACLClouds Free Bot 托管自动续期。Free 套餐约 4 天到期，到期前 2
 
 到期自适应：API 返回 `422 renew_too_early` 时，脚本按 `到期时间 - 48h` 计算开窗时刻，若在 job 预算内（≤5h）则睡到开窗后重试一次；超出预算则留给下一次 cron（48h 窗口 × 48h 间隔，必有一次落在窗口内）。
 
+Keepalive：公开仓库 60 天无 commit 会被 GitHub 自动停用 scheduled workflow。定时运行时若距上次 keepalive 提交 ≥30 天，会自动提交 `.github/.keepalive`（github-actions[bot] 身份）保持活跃。
+
 Secrets（两套命名二选一，都配则以 `ACL_` 为准）：
 
 | 名 | 用途 |

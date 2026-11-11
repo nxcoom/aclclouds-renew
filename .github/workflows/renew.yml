@@ -8,7 +8,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 concurrency:
@@ -76,3 +76,23 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: node renew.mjs
+
+      # GitHub 会在公开仓库 60 天无 commit 后自动停用 scheduled workflow。
+      # 此步骤每 30 天提交一次 keepalive 文件保持活跃；仅定时触发时执行，失败不影响续期结果。
+      - name: Keepalive
+        if: ${{ always() && github.event_name == 'schedule' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          LAST=$(git log -1 --format=%ct -- .github/.keepalive 2>/dev/null)
+          LAST=${LAST:-0}
+          NOW=$(date +%s)
+          AGE=$((NOW - LAST))
+          if [ "$AGE" -lt 2592000 ]; then
+            echo "上次 keepalive 提交距今 $((AGE / 86400)) 天，跳过"
+            exit 0
+          fi
+          echo "keepalive $(date -u '+%Y-%m-%dT%H:%M:%SZ') run=${{ github.run_id }}" >> .github/.keepalive
+          git add .github/.keepalive
+          git commit -m "chore: keepalive $(date -u '+%Y-%m-%d')" || exit 0
+          git push || echo "::warning::keepalive push 失败(远端可能有新提交)，不影响续期"
