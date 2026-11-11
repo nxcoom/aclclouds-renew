@@ -2,9 +2,9 @@ name: ACLClouds Auto Renew
 
 on:
   schedule:
-    # 每天执行一次，北京时间早上 07:28 (UTC 23:28)
-    # 窗口外返回 422 renew_too_early 按 skip 处理，成本极低；避免续期窗口只落在单次运行上
-    - cron: '28 23 * * *'
+    # 每两天执行一次，北京时间早上 0:32 (UTC 16:32, UTC 单数日触发)
+    # 窗口外返回 422 renew_too_early 按 skip 处理；脚本会在窗口临近时自行等待开窗后重试
+    - cron: '32 16 */2 * *'
   workflow_dispatch: {}
 
 permissions:
@@ -18,7 +18,8 @@ concurrency:
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 脚本可能在窗口临近时睡等开窗 (上限 5h), 远小于 GitHub 单 job 6h 上限
+    timeout-minutes: 345
     steps:
       - uses: actions/checkout@v4
 

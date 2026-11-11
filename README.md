@@ -1,6 +1,6 @@
 # ACLClouds Auto-Renew
 
-ACLClouds Free Bot 托管自动续期。Free 套餐约 4 天到期，到期前 2 天才开放续期。脚本用账号密码登录（登录验证码为 Cap 工作量证明组件，自动求解），发现服务 id，UI + API 双路径续期，并回读订阅接口校验到期时间真的后移。GitHub Actions 每天跑一次，结果发 Telegram。
+ACLClouds Free Bot 托管自动续期。Free 套餐约 4 天到期，到期前 2 天才开放续期。脚本用账号密码登录（登录验证码为 Cap 工作量证明组件，自动求解），发现服务 id，UI + API 双路径续期，并回读订阅接口校验到期时间真的后移。GitHub Actions 每两天跑一次，422 未到窗口时脚本会按到期时间睡到开窗再重试（≤5h），等效跟着到期时间调度。
 
 ## 做什么
 
@@ -27,7 +27,9 @@ ACLClouds Free Bot 托管自动续期。Free 套餐约 4 天到期，到期前 2
 
 ## GitHub Actions
 
-`.github/workflows/renew.yml`：每天 UTC `23:28`（北京时间 07:28），也可手动 Run workflow。
+`.github/workflows/renew.yml`：每两天 UTC `16:32`（北京时间 0:32），也可手动 Run workflow。
+
+到期自适应：API 返回 `422 renew_too_early` 时，脚本按 `到期时间 - 48h` 计算开窗时刻，若在 job 预算内（≤5h）则睡到开窗后重试一次；超出预算则留给下一次 cron（48h 窗口 × 48h 间隔，必有一次落在窗口内）。
 
 Secrets（两套命名二选一，都配则以 `ACL_` 为准）：
 
@@ -62,7 +64,8 @@ node with-env.cjs
 - UI + API 双路径续期；UI 点击后回读订阅接口校验 `expires_at` 后移，避免静态文本误判成功
 - `422 renew_too_early` 视为未到窗口；`403 captcha_required` 过 Cap 盾后带 token 重试
 - 续期成功后校验到期时间并写入 TG
-- Actions 每天定时 + Secrets / Variable；Playwright 安装带 apt DNS 容错与浏览器缓存
+- Actions 每两天定时（北京 0:32）+ Secrets / Variable；Playwright 安装带 apt DNS 容错与浏览器缓存
+- 422 后按到期时间睡等到窗口打开再重试（≤5h/job 预算），续期时点紧贴开窗
 - 2026-11-12 实测：窗口内 UI 续期成功，到期 11-13 → 11-17 (+4 天)
 
 **待做**

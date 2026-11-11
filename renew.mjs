@@ -402,6 +402,20 @@ function formatRemaining(expiresAt) {
   return `${d}天${h}小时 (到期: ${expStr})`;
 }
 
+// 站点规则: 到期前 48h 开放续期 (422 renew_too_early)。
+// 422 后若窗口将在预算内打开, 睡到开窗重试, 使续期紧贴窗口而不是赌 cron 落点。
+const RENEW_WINDOW_MS = 48 * 3600e3;
+const JOB_STARTED_AT = Date.now();
+const JOB_BUDGET_MS = 5.5 * 3600e3; // GitHub 单 job 上限 6h, 留余量给实际续期
+const MAX_WAIT_MS = 5 * 3600e3;
+
+function msUntilRenewWindow(expiresAt) {
+  if (!expiresAt) return -1;
+  const t = new Date(expiresAt).getTime();
+  if (isNaN(t)) return -1;
+  return t - RENEW_WINDOW_MS + 3 * 60e3 - Date.now();
+}
+
 async function discover(page) {
   const servers = [];
   const seen = new Set();
@@ -550,7 +564,7 @@ async function getRenewalCaptchaToken(page) {
   return solveCaptchaApi(page, 'renewal_gate');
 }
 
-async function tryRenew(page, server) {
+async function tryRenew(page, server, allowWait = true) {
   const id = server.id;
   const name = server.name || id;
   log(`开始检查续期: ${name} (${id})`);
@@ -682,6 +696,18 @@ async function tryRenew(page, server) {
       log(`续期校验通过: ${name} 到期 ${server.expiresAt} -> ${afterExpiry}`);
     } else {
       log(`续期 API 返回成功, 但到期时间未确认后移 (before=${server.expiresAt || '未知'} after=${afterExpiry || '未读到'})`);
+    }
+  }
+
+  // 422 = 站点确认未到窗口。若窗口将在预算内打开, 睡到开窗后整体重试一次;
+  // 超出预算则交回下一次 cron (48h 窗口 × 48h 间隔, 必有一次落在窗口内)。
+  if (c.skip && allowWait) {
+    const waitMs = msUntilRenewWindow(server.expiresAt);
+    const budget = JOB_BUDGET_MS - (Date.now() - JOB_STARTED_AT) - 10 * 60e3;
+    if (waitMs > 0 && waitMs <= Math.min(MAX_WAIT_MS, budget)) {
+      log(`窗口未开, 预计 ${Math.round(waitMs / 60e3)} 分钟后开放, 等待后重试 (到期: ${server.expiresAt})...`);
+      await page.waitForTimeout(waitMs);
+      return tryRenew(page, server, false);
     }
   }
 
