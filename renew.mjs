@@ -562,6 +562,18 @@ async function solveCapCaptcha(page) {
   });
 }
 
+async function getServiceExpiry(page, id) {
+  try {
+    const r = await api(page, '/api/client/credits/subscriptions');
+    if (r.status !== 200 || !Array.isArray(r.data?.subscriptions)) return null;
+    for (const s of r.data.subscriptions) {
+      const sid = String(s.service_id || s.id || '').replace(/^hosting-/, '');
+      if (sid === id) return s.expires_at || null;
+    }
+  } catch {}
+  return null;
+}
+
 async function getRenewalCaptchaToken(page) {
   try {
     const token = await solveCapCaptcha(page);
@@ -605,7 +617,9 @@ async function tryRenew(page, server) {
     }
 
     if (targetBtn) {
-      log(`找到 /server/${id} UI 续期按钮 [${matchedPat}], 执行点击...`);
+      const beforeExpiry = server.expiresAt || (await getServiceExpiry(page, id));
+      const beforeMs = beforeExpiry ? new Date(beforeExpiry).getTime() : NaN;
+      log(`找到 /server/${id} UI 续期按钮 [${matchedPat}], 执行点击... (当前到期: ${beforeExpiry || '未知'})`);
       let clicked = false;
       try {
         await targetBtn.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
@@ -637,12 +651,24 @@ async function tryRenew(page, server) {
           }
         }
 
-        // 验证 UI 结果
-        const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
-        if (/Serveur renouvelé/i.test(bodyText) || /Expire dans\s+[2-9]j/i.test(bodyText) || /renouvelé/i.test(bodyText)) {
-          log(`UI 续期验证成功: ${name}`);
-          return { id, ok: true, skip: false, text: `${name} (${id}): UI 续期成功` };
+        // 验证 UI 结果: 不再用页面静态文本判断 (旧文本 "Expire dans 2j" 会误报成功并跳过 API 续期),
+        // 改为轮询订阅接口, 确认 expires_at 真的往后推。
+        let verified = false;
+        let observedExpiry = beforeExpiry;
+        for (let k = 0; k < 10 && !verified; k++) {
+          await page.waitForTimeout(2000);
+          const nowExpiry = await getServiceExpiry(page, id);
+          if (nowExpiry) observedExpiry = nowExpiry;
+          const nowMs = nowExpiry ? new Date(nowExpiry).getTime() : NaN;
+          if (Number.isFinite(nowMs) && Number.isFinite(beforeMs) && nowMs > beforeMs + 60 * 60 * 1000) {
+            verified = true;
+          }
         }
+        if (verified) {
+          log(`UI 续期验证成功: ${name} 到期 ${beforeExpiry || '?'} -> ${observedExpiry}`);
+          return { id, ok: true, skip: false, text: `${name} (${id}): UI 续期成功 (到期: ${observedExpiry})` };
+        }
+        log(`UI 点击后到期时间未见后移 (当前: ${observedExpiry || '未知'}), 转入 API 续期兜底`);
       }
     } else {
       log(`未在 /server/${id} 找到可见续期按钮，直接进入 API 续期逻辑`);
@@ -678,7 +704,23 @@ async function tryRenew(page, server) {
     }
   }
 
+  // 续期后校验: 回读订阅接口, 确认 200 之后到期时间真的往后推
+  let verifiedExpiry = null;
+  if (c.ok && !c.skip) {
+    const beforeMs = server.expiresAt ? new Date(server.expiresAt).getTime() : NaN;
+    await page.waitForTimeout(3000);
+    const afterExpiry = await getServiceExpiry(page, id);
+    const afterMs = afterExpiry ? new Date(afterExpiry).getTime() : NaN;
+    if (Number.isFinite(afterMs) && Number.isFinite(beforeMs) && afterMs > beforeMs + 60 * 60 * 1000) {
+      verifiedExpiry = afterExpiry;
+      log(`续期校验通过: ${name} 到期 ${server.expiresAt} -> ${afterExpiry}`);
+    } else {
+      log(`续期 API 返回成功, 但到期时间未确认后移 (before=${server.expiresAt || '未知'} after=${afterExpiry || '未读到'})`);
+    }
+  }
+
   let resultText = `${name} (${id}): ${c.text}`;
+  if (verifiedExpiry) resultText += ` (到期: ${verifiedExpiry})`;
   const exactRemaining = formatRemaining(server.expiresAt);
   if (c.skip && exactRemaining) {
     resultText = `${name} (${id}): 未到续期窗口，剩余 ${exactRemaining}`;

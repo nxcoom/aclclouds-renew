@@ -2,8 +2,9 @@ name: ACLClouds Auto Renew (fixed)
 
 on:
   schedule:
-    # 每两天执行一次，北京时间早上 07:28 (UTC 23:28)
-    - cron: '28 23 */2 * *'
+    # 每天执行一次，北京时间早上 07:28 (UTC 23:28)
+    # 窗口外返回 422 renew_too_early 按 skip 处理，成本极低；避免续期窗口只落在单次运行上
+    - cron: '28 23 * * *'
   workflow_dispatch: {}
 
 permissions:
